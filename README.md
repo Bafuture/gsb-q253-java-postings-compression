@@ -30,3 +30,97 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 253）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+# 实现说明（分支 B）
+
+## 组件结构
+
+```
+src/main/java/com/example/gsb/postings/
+├── VarIntCodec.java          # 变长整数（VByte）编解码
+├── CompressedPostings.java   # 压缩倒排表（不可变）+ 跳表
+├── PostingsIterator.java     # 只读游标：next / advance（跳表快进）
+├── Intersections.java        # 两表 / 多表求交
+├── IntersectionResult.java   # 求交结果（文档号 + 统计）
+└── IntersectionStats.java    # 解码次数 / 跳跃次数 / 耗时统计
+```
+
+## 1. 压缩编码规则（差值 + 变长整数）
+
+文档号严格升序保存 `d0 < d1 < ... < d(n-1)`，不直接存文档号，而是存差值（gap）：
+
+- `g0 = d0`，`gi = di - d(i-1)`（i > 0），所有 gap 均为正整数；
+- 每个 gap 用 **VByte 变长编码**写入字节流：每字节低 7 位存数据、最高位为续传标志
+  （1 = 还有后续字节，0 = 最后一字节），7 位组按小端组序写出（低组在前）。
+  例：`300 = [0xAC, 0x02]`。
+- 字节数随数值分档：`[0, 2^7)` 1 字节、`[2^7, 2^14)` 2 字节、`[2^14, 2^21)` 3 字节……
+  倒排表相邻文档号通常很接近，gap 小，绝大多数只需 1~2 字节，
+  相比 int32（固定 4 字节）压缩率约 25%~50%（见 `CompressionRatioTest`）。
+
+## 2. 解码与跳表结构
+
+- 顺序解码：`PostingsIterator.next()` 从字节流读一个变长整数累加到基准文档号上。
+- 跳表：每 `skipInterval`（默认 128）个文档号记录一个跳表项
+  `{文档号, 字节偏移, 解码基准（前一文档号）}`，第 s 项对应文档索引 `s * skipInterval`。
+  跳表开销为 `O(n / skipInterval)` 项（每项 12 字节），相对原始存储不到 5%。
+- `advance(target)`：先**二分跳表数组**定位最后一个文档号 ≤ target 的跳表项，
+  直接把字节偏移/基准/索引跳到该块，再只在**一个块内**顺序解码到 ≥ target，
+  块之前的文档完全不解码。
+
+## 3. 两表求交与复杂度
+
+`Intersections.intersect(a, b)` 用两个游标互相 `advance`：谁小谁向对方当前文档号快进，
+相等即命中。设表长 `m ≤ n`，跳表块大小 `B`，跳表项数 `S = n/B`：
+
+- 单次 `advance`：二分跳表 `O(log S)` + 块内解码 `O(B)`；
+- 设推进次数为 `k`（`k ≤ 2m`，交集越稀疏 k 越小），总复杂度 `O(k · (log S + B))`；
+- 取 `B ≈ √n` 时单次 `advance` 为 `O(√n)`。当一表稀疏一表密集或交集稀疏时，
+  解码总量远小于朴素归并的 `O(m + n)`（测试断言解码次数 < 两表总长的 1/20）；
+- 最坏情况（两表完全交错）退化为与归并同阶的 `O(m + n)`，不会更差。
+
+## 4. 正确性验证
+
+`IntersectionTest` 用固定 seed 的随机倒排表做大规模对照：
+120 组两表（表长至 5 万、随机 gap、随机 skipInterval）与 60 组多表（3~6 张），
+全部与朴素逐条归并结果逐一相等；另有 `advance` 与“第一个 ≥ target”逐点对照测试。
+
+## 5. 多表求交与处理顺序
+
+`Intersections.intersect(List)` 支持任意多张表（含 3 个以上）：
+
+- 进入前**按表长升序排列（短表优先）**：空表立即短路；最短表长度即结果上界；
+- 多路对齐循环：取各游标当前文档号的最大值为目标，落后的表用跳表 `advance` 对齐目标，
+  全部相等则命中；某表越过目标则以更大值重新对齐；
+- **顺序对性能的影响**：短表（通常文档密、gap 小）排前面先推进，其 `advance` 多在
+  单个 skip 块内完成，代价低；若采用“两两依次求交”策略，更应先交最短的两张表，
+  使中间结果最小，否则会产生大量注定不命中最终交集的候选，放大 advance 与解码次数。
+  算法对输入顺序不敏感，打乱顺序结果完全一致（有测试保证）。
+
+## 6. 并发求交
+
+`CompressedPostings` 构建后完全不可变（字节流与跳表数组均为 final 且不外泄可变引用）；
+每次求交新建独立的 `PostingsIterator`（游标状态私有）与独立的 `IntersectionStats`，
+因此多线程并发求交只读共享压缩数据，无需任何锁，互不干扰也不会破坏压缩数据。
+`ConcurrencyTest` 用 12 线程 × 100 轮并发执行 40 个固定查询计划，
+结果全部与单线程基准一致，且并发后压缩数据可完整解码回原始文档号。
+
+## 7. 统计
+
+- 压缩：`rawBytes()`（压缩前 int32 字节数）、`compressedBytes()`（压缩后字节数）、
+  `compressionRatio()` / `compressionRatioWithSkipTable()`、`skipTableBytes()`；
+- 求交（每次求交独立统计）：`decodedCount()`（实际解码的 gap 数）、
+  `skipCount()`（跳表块跳跃次数）、`elapsedNanos()` / `elapsedMillis()`（求交耗时）。
+
+## 8. 测试覆盖
+
+| 测试类 | 覆盖点 |
+|--------|--------|
+| `VarIntCodecTest` | 边界值/具体字节布局/10 万随机值编码解码往返、负值拒绝 |
+| `CompressedPostingsTest` | 压缩表编解码往返、跳表项数量、`advance` 逐点对照与单调性、跳跃非全扫、非法输入 |
+| `IntersectionTest` | 两表/多表随机大规模对照暴力归并、顺序无关性、非退化（解码次数有界）、统计字段 |
+| `ConcurrencyTest` | 12 线程并发求交结果一致、压缩数据不被破坏、游标独立 |
+| `CompressionRatioTest` | 密集/稀疏表压缩率区间、跳表开销上界、统计一致性 |
+
+运行：`./mvnw -q verify`（或 `mvn -q verify`）。
